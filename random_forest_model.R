@@ -1,0 +1,275 @@
+library(randomForest)
+library(dplyr)
+library(tidyverse)
+library(caret)
+library(caTools)
+library(rsample)
+library(randomForestExplainer)
+library(ranger)
+library(ggplot2)
+
+
+rm(list = ls())
+set.seed(12345)
+
+#########################
+####### Load data #######
+#########################
+
+load <- read.csv("data/Amass_data_3.csv")
+
+response_var <- "Amass"  
+formula <- as.formula(paste(response_var, "~ .")) 
+
+# Remove species names
+data <- load %>% select(- species_Name) 
+
+#########################
+##### Default model #####
+#########################
+set.seed(12345)
+m1 <- randomForest(
+  formula =  formula,
+  data    = data
+)
+m1
+
+plot(m1)
+
+################################
+#### Tuning Hyperparameters ####
+################################
+
+# hyperparameter grid search
+hyper_grid <- expand.grid(
+  mtry       =    c(18, 312, 50, 72, 227, 454, 908), 
+  num_trees  = seq(400, 500, by = 100), 
+  OOB_RMSE   = 0
+)
+
+# total number of combinations
+nrow(hyper_grid)
+
+for(i in 1:nrow(hyper_grid)) {
+  
+  # train model
+  model <- ranger(
+    formula         = formula,
+    data            = data, 
+    num.trees       = hyper_grid$num_trees[i],
+    mtry            = hyper_grid$mtry[i],
+    seed            = 123
+  )
+  
+  # add OOB error to grid
+  hyper_grid$OOB_RMSE[i] <- sqrt(model$prediction.error)
+}
+
+hyper_grid %>% 
+  dplyr::arrange(OOB_RMSE) %>%
+  head(10)
+
+###################################
+### Visualizing hyperparameters ###
+####################################
+tuning_grid <- expand.grid(
+  trees = seq(10, 1000, by = 20),
+  mtry  =c(19, 37, 512, 74, 227, 454, 908),
+  rmse  = NA
+)
+
+for(i in seq_len(nrow(tuning_grid))) {
+  fit <- ranger(
+    formula    = formula, 
+    data       = data, 
+    num.trees  = tuning_grid$trees[i],
+    mtry       = tuning_grid$mtry[i],
+    respect.unordered.factors = 'order',
+    verbose    = FALSE,
+    seed       = 123
+  )
+  
+  tuning_grid$rmse[i] <- sqrt(fit$prediction.error)
+  
+}
+
+labels <- tuning_grid %>%
+  filter(trees == 990) %>%
+  mutate(mtry = as.factor(mtry))
+
+pdf("TuningGrid_Amass_3.pdf", width = 12, height = 12)
+tuning_grid %>%
+  mutate(mtry = as.factor(mtry)) %>%
+  ggplot(aes(trees, rmse, color = mtry)) +
+  geom_line(size = 1, show.legend = FALSE) +
+  ggrepel::geom_text_repel(data = labels, aes(trees, rmse, label = mtry), nudge_x = 50, show.legend = FALSE) +
+  ylab("OOB Error (RMSE)") +
+  xlab("Number of trees") +
+  theme_bw() +
+  theme(plot.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())
+dev.off()
+
+
+
+#########################
+##### LOOCV function ####
+#########################
+
+loocv_rf <- function(formula, data) {
+  n <- nrow(data)
+  predictions <- numeric(n)
+  importance_list <- list()  
+  
+  for (i in 1:n) {
+    set.seed(12345)
+    # Leave one out
+    training_data <- data[-i, ]
+    validation_data <- data[i, ]
+    
+    # Train the model
+    model <- randomForest(
+      formula = formula,
+      data = training_data,
+      mtry = 75, 
+      ntree = 500,  
+      importance = TRUE  
+    )
+    
+
+    predictions[i] <- predict(model, validation_data)
+    
+
+    importance_list[[i]] <- randomForest::importance(model)
+  }
+  
+
+  rmse <- sqrt(mean((predictions - data$Amass)^2))
+  
+
+  mae <- mean(abs(predictions - data$Amass))
+  
+
+  y <- data$Amass
+  r2 <- 1 - sum((y - predictions)^2) / sum((y - mean(y))^2)
+  
+
+  importance_aggregated <- Reduce(`+`, importance_list) / n  # Average importance
+  
+  return(list(rmse = rmse, mae = mae, r2 = r2, predictions = predictions, importance = importance_aggregated))
+}
+
+
+#########################
+##### Perform LOOCV #####
+#########################
+
+set.seed(12345)
+loocv_results <- loocv_rf(formula, data)
+
+
+print(loocv_results$rmse)
+print(loocv_results$mae)
+print(loocv_results$r2)
+
+#########################
+## Variable Importance ##
+#########################
+
+
+plot_data <- data.frame(
+  Actual = data$Amass, # Predicted values from LOOCV
+)
+write.csv(plot_data, "plot_data_Amass_data_3.csv", row.names = FALSE) 
+#
+
+plot_data <- read.csv("plot_data_Amass_data_3.csv")
+
+r2   <- 0.22 #round(loocv_results$r2, 2)
+rmse <- 112.87 #round(loocv_results$rmse, 2)
+mae  <- 79.1 #round(loocv_results$mae, 2)
+
+pdf("plots/Actual_vs_Predicted_plot_data_Amass_3.pdf", width = 6, height = 6)
+
+ggplot(plot_data, aes(x = Actual, y = Predicted)) +
+  geom_point(color = "deepskyblue1") +
+  geom_smooth(method = "lm", color = "black", se = FALSE) +  # Add regression line
+  labs(x = expression(paste("Actual A"["mass"], " (nmol ", "g"^{-1}, " s"^{-1}, ")")), #nmol g-1 s-1
+       y = expression(paste("Predicted A"["mass"], " (nmol ", "g"^{-1}, " s"^{-1}, ")"))) +
+  theme_bw() +
+  theme(plot.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())+
+  annotate("text",
+           x = 10, y = 340,
+           hjust = 0, 
+           label = paste("R² = ", r2,
+                         "\nRMSE = ", rmse,
+                         "\nMAE = ", mae),
+           size = 3.5)
+
+# Close the PDF device
+dev.off()
+
+#expression(paste("Predicted A"["mass"], " (nmol ", "g"^{-1}, " s"^{-1}, ")"))
+#expression(paste("Predicted Sc/o", " (mol ", "mol"^{-1}, ")")
+#expression(paste("Actual KC"^{"21%02"}, " (µM)"))
+#expression(paste("Actual Amass", " (S"^{-1}, ")"))
+#expression(paste("Actual N"["mass"], " (%N)"))
+#expression(paste("Actual PNUE"["area"], " (µmol ", "m"^{-2}, " s"^{-1}," N"["area"], ""^{-1}, ")"))
+#expression(paste("Actual PNUE"["mass"], " (nmol ", "g"^{-1}, " s"^{-1}," N"["mass"], ""^{-1}, ")"))
+#expression(paste("Actual N"["area"], " (g ", "m"^{-2}, " N)"))
+#expression(paste("Actual A"["area"], " (µmol ", "m"^{-2}, " s"^{-1}, ")"))
+
+####################
+# Random Forest 2 #
+###################
+set.seed(12345)
+m2 <- randomForest(
+  formula = formula,
+  data    = data,
+  mtry = 31,
+  keep.inbag = TRUE, 
+  importance=TRUE, 
+  prox=TRUE
+)
+m2
+
+set.seed(12345)
+varImportance <- randomForest::importance(m2)
+varImportance <- data.frame(Matrix = row.names(varImportance), varImportance)
+write.csv(varImportance, "Scaled_variable_importance_Amass_3.csv", row.names = FALSE)
+# scaled importance values (equivalent to that in varImpPlot)
+
+varImpPlot(m2, sort=TRUE, n.var=20)
+pdf("plots/Simple_variable_importance_Amass_3.pdf", paper='A4') 
+varImpPlot(m2, sort=TRUE, n.var=20)
+dev.off()
+
+
+set.seed(12345)
+min_depth_frame <- min_depth_distribution(m2)
+plot_min_depth_distribution(min_depth_frame)
+pdf("plots/min_depth_distribution_Amass_3.pdf",paper='A4') 
+plot_min_depth_distribution(min_depth_frame)
+dev.off()
+
+# > min_depth_frame <- min_depth_distribution(m2)
+# Error in 1:nrow(tree) : argument of length 0
+
+importance_frame <- measure_importance(m2)
+importance_frame$adj<-p.adjust(importance_frame$p_value, method = "BH")
+importance_frame<-importance_frame[order(importance_frame$adj),]
+write.table(importance_frame, file="Variable_importance_Amass_3.txt")
+
+plot_multi_way_importance(importance_frame, size_measure = "no_of_nodes")
+plot_multi_way_importance(importance_frame, x_measure = "mse_increase", y_measure = "node_purity_increase", size_measure = "p_value", no_of_labels = 5)
+
+pdf("plots/multi_way_importance_count_Amass_3.pdf",paper='A4') 
+plot_multi_way_importance(importance_frame, size_measure = "no_of_nodes")
+dev.off()
+
+pdf("plots/multi_way_importance_pvalue_Amass_3.pdf",paper='A4') 
+plot_multi_way_importance(importance_frame, x_measure = "mse_increase", y_measure = "node_purity_increase", size_measure = "p_value", no_of_labels = 5)
+dev.off()
